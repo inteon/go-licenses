@@ -64,6 +64,33 @@ func (i *Info) FileURL(pathname string) string {
 	})
 }
 
+// RawURL returns a URL referring to the raw contents of a file relative to the
+// module's home directory.
+func (i *Info) RawURL(pathname string) string {
+	if i == nil {
+		return ""
+	}
+	// Some templates don't support raw content serving.
+	if i.templates.Raw == "" {
+		return ""
+	}
+	moduleDir := i.moduleDir
+	// Special case: the standard library's source module path is set to "src",
+	// which is correct for source file links. But the README is at the repo
+	// root, not in the src directory. In other words,
+	// Module.Units[0].Readme.FilePath is not relative to
+	// Module.Units[0].SourceInfo.moduleDir, as it is for every other module.
+	// Correct for that here.
+	if i.repoURL == stdlib.GoSourceRepoURL {
+		moduleDir = ""
+	}
+	return expand(i.templates.Raw, map[string]string{
+		"repo":   i.repoURL,
+		"commit": i.commit,
+		"file":   path.Join(moduleDir, pathname),
+	})
+}
+
 type Client struct {
 	// client used for HTTP requests. It is mutable for testing purposes.
 	// If nil, then moduleInfoDynamic will return nil, nil; also for testing.

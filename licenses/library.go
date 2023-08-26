@@ -18,9 +18,13 @@ import (
 	"context"
 	"fmt"
 	"go/build"
+	"io"
+	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/go-licenses/v2/internal/third_party/pkgsite/source"
 	"golang.org/x/sync/errgroup"
@@ -351,12 +355,17 @@ func (l *Library) String() string {
 	return l.Name()
 }
 
-// FileURL attempts to determine the URL for a file in this library using
-// go module name and version.
-func (l *Library) FileURL(ctx context.Context, cl *source.Client, filePath string) (string, error) {
+// testOnlySkipValidation is an internal flag to skip validation during testing,
+// because we cannot easily set up actual license files on disk.
+var testOnlySkipValidation = false
+
+// LicenseURL attempts to determine the URL for the license file in this library
+// using go module name and version.
+func (l *Library) LicenseURL(ctx context.Context, cl *source.Client) (string, error) {
 	if l == nil {
 		return "", fmt.Errorf("library is nil")
 	}
+	filePath := l.LicenseFile
 	wrap := func(err error) error {
 		return fmt.Errorf("getting file URL in library %s: %w", l.Name(), err)
 	}
@@ -397,9 +406,88 @@ func (l *Library) FileURL(ctx context.Context, cl *source.Client, filePath strin
 	if err != nil {
 		return "", wrap(err)
 	}
-	// TODO: there are still rare cases this may result in an incorrect URL.
-	// https://github.com/google/go-licenses/issues/73#issuecomment-1005587408
-	return remote.FileURL(relativePath), nil
+	url := remote.FileURL(relativePath)
+	if testOnlySkipValidation {
+		return url, nil
+	}
+	// An error during validation, the URL may still be valid.
+	validationError := func(err error) error {
+		return fmt.Errorf("failed to validate %s: %w", url, err)
+	}
+	localContentBytes, err := os.ReadFile(l.LicenseFile)
+	if err != nil {
+		return "", validationError(err)
+	}
+	localContent := string(localContentBytes)
+	// Attempt 1
+	rawURL := remote.RawURL(relativePath)
+	if rawURL == "" {
+		klog.Warningf(
+			"Skipping license URL validation, because %s. Please verify whether %s matches content of %s manually!",
+			validationError(fmt.Errorf("remote repo %s does not support raw URL", remote)),
+			url,
+			l.LicenseFile,
+		)
+		return url, nil
+	}
+	validationError1 := validate(rawURL, localContent)
+	if validationError1 == nil {
+		// The found URL is valid!
+		return url, nil
+	}
+	if relativePath != "LICENSE" {
+		return "", validationError1
+	}
+	// Attempt 2 when relativePath == "LICENSE"
+	// When module is at a subdir, the LICENSE file we find at root
+	// of the module may actually lie in the root of the repo, due
+	// to special go module behavior.
+	// Reference: https://github.com/google/go-licenses/issues/73#issuecomment-1005587408.
+	url2 := remote.RepoFileURL("LICENSE")
+	rawURL2 := remote.RepoRawURL("LICENSE")
+	if url2 == url {
+		// Return early, because the second attempt resolved to the same file.
+		return "", validationError1
+	}
+	// For the same remote, no need to check rawURL != "" again.
+	validationError2 := validate(rawURL2, localContent)
+	if validationError2 == nil {
+		return url2, nil
+	}
+	return "", fmt.Errorf("cannot infer remote URL for %s, failed attempts:\n\tattempt 1: %s\n\tattempt 2: %s", l.LicenseFile, validationError1, validationError2)
+}
+
+// validate validates content of rawURL matches localContent.
+func validate(rawURL string, localContent string) error {
+	remoteContent, err := download(rawURL)
+	if err != nil {
+		// Retry after 1 sec.
+		time.Sleep(time.Second)
+		remoteContent, err = download(rawURL)
+		if err != nil {
+			return err
+		}
+	}
+	if remoteContent != localContent {
+		return fmt.Errorf("local license file content does not match remote license URL %s", rawURL)
+	}
+	return nil
+}
+
+func download(url string) (string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("download(%q): %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("download(%q): response status code %v not OK", url, resp.StatusCode)
+	}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("download(%q): failed to read from response body: %w", url, err)
+	}
+	return string(bodyBytes), nil
 }
 
 func (l *Library) Version() string {
