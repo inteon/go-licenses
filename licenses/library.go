@@ -17,7 +17,6 @@ package licenses
 import (
 	"context"
 	"fmt"
-	"go/build"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -411,19 +410,18 @@ func (l *Library) Version() string {
 
 // isStdLib returns true if this package is part of the Go standard library.
 func isStdLib(pkg *packages.Package) bool {
-	if pkg.Name == "unsafe" {
-		// Special case unsafe stdlib, because it does not contain go files.
-		return true
-	}
-	if len(pkg.GoFiles) == 0 {
+	// For stdlib modules, the Module will be nil
+	if pkg.Module != nil {
 		return false
 	}
-	prefix := build.Default.GOROOT
-	sep := string(filepath.Separator)
-	if !strings.HasSuffix(prefix, sep) {
-		prefix += sep
+
+	// If the pkg.PkgPath does not have a dot in its first
+	// '/'-split section, assume the package is from stdlib.
+	path := pkg.PkgPath
+	if i := strings.IndexByte(path, '/'); i != -1 {
+		path = path[:i]
 	}
-	return strings.HasPrefix(pkg.GoFiles[0], prefix)
+	return !strings.Contains(path, ".")
 }
 
 // isTestBinary returns true iff pkg is a test binary.
